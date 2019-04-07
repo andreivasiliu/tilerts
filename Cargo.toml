@@ -6,3 +6,5 @@ edition = "2018"
 
 [dependencies]
 ggez = "0.5.0-rc.1"
+noise = "0.5.1"
+pathfinding = "1.1.12"
