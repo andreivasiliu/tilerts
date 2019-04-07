@@ -9,6 +9,10 @@ struct MyGame {
     selecting: Option<(f32, f32, f32, f32)>,
 }
 
+struct Unit {
+    position: (f32, f32),
+}
+
 impl EventHandler for MyGame {
     fn update(&mut self, _ctx: &mut Context) -> GameResult<()> {
         if self.focused && self.focus_color < 0.3 {
@@ -73,7 +77,7 @@ fn main() -> GameResult {
         .window_mode(ggez::conf::WindowMode {
             width: 1024.0,
             height: 768.0,
-            resizable: true,
+            resizable: false,
             ..Default::default()
         })
         .build()?;
