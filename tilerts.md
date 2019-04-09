@@ -24,3 +24,32 @@ Things I need to solve:
 ### Path-finding
 
 * What's the MVP?
+  * Still have no clue.
+
+### Structures
+
+* Gathering tiles
+  * Worker unit (done!)
+  * Tile unit
+  * Right-click map tile selector
+  * Pathfinding
+  * Proximity check
+  * Per-tile mining progress
+  * Gathering GFX
+  * Map tile deletion, unit tile creation
+* Processing
+  * Turn a tile into another kind of tile
+  * Factory tile sprite
+* Tile towing
+  * Right-click unit tile selector
+  * Unit -> unit association
+  * Some sort of physics?
+* Terraforming
+  * Mark intent on ground tile
+  * Factory slot tile sprite
+  * Intent GFX
+* Tile snapping
+  * Non-intentional rotation, movement
+  * Three-way (unit, tile, slot) decision
+* Factory
+  * ???

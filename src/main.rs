@@ -10,9 +10,11 @@ struct MyGame {
     focused: bool,
     selecting: Option<(Point2<f32>, Point2<f32>)>,
     units: Vec<Unit>,
-    vehicle_image: graphics::Image,
     window_size: Vector2<f32>,
     game_map: GameMap,
+    vehicle_image: graphics::Image,
+    sand_image: graphics::Image,
+    rock_image: graphics::Image,
 }
 
 struct GameMap {
@@ -78,6 +80,11 @@ impl GameMap {
                 2 => 14, // ~= sqrt(2) * 10, diagonal of a square
                 _ => 10, // 1 * 10
             }
+        }
+
+        let current_tile = self.to_tile(target);
+        if !self.tile(current_tile.0, current_tile.1).passable() {
+            return Default::default();
         }
 
         pathfinding::directed::dijkstra::dijkstra_all(&(x, y), |(x, y)| {
@@ -166,6 +173,8 @@ impl GroundTile {
 impl MyGame {
     fn new(ctx: &mut Context) -> GameResult<Self> {
         let vehicle_image = graphics::Image::new(ctx, "/vehicle.png")?;
+        let sand_image = graphics::Image::new(ctx, "/sand.png")?;
+        let rock_image = graphics::Image::new(ctx, "/rock.png")?;
 
         use noise::{Billow, NoiseFn};
         let billow = Billow::new();
@@ -188,9 +197,11 @@ impl MyGame {
             focused: true,
             selecting: None,
             units: Vec::default(),
-            vehicle_image,
             window_size: Vector2::new(0.0, 0.0),
             game_map,
+            vehicle_image,
+            sand_image,
+            rock_image,
         })
     }
 }
@@ -287,6 +298,7 @@ impl EventHandler for MyGame {
                     match interpolate_flow(flow.as_ref(), unit.position) {
                         Some(x) => x.clone(),
                         None => {
+                            unit.intended_direction = None;
                             unit.target = None;
                             unit.path = None;
                             continue
@@ -323,25 +335,24 @@ impl EventHandler for MyGame {
         graphics::clear(ctx, (0.2, 0.2, self.focus_color).into());
 
         // Draw ground
-        let mut rocks = graphics::MeshBuilder::new();
+        let mut sand = graphics::spritebatch::SpriteBatch::new(self.sand_image.clone());
+        let mut rocks = graphics::spritebatch::SpriteBatch::new(self.rock_image.clone());
 
         for x in 0..((self.window_size.x / 16.0) as usize) {
             for y in 0..((self.window_size.y / 16.0) as usize) {
-                let elevation = self.game_map.tile(x, y).elevation;
-                let (x, y) = (x as f32, y as f32);
+                let draw_param = graphics::DrawParam::new()
+                    .scale(Vector2::new(0.5, 0.5))
+                    .dest(Point2::new(x as f32 * 16.0, y as f32 * 16.0));
 
-                if elevation > MAX_ELEVATION {
-                    rocks.rectangle(
-                        graphics::DrawMode::fill(),
-                        [16.0 * x, 16.0 * y, 16.0, 16.0].into(),
-                        graphics::BLACK,
-                    );
+                if self.game_map.tile(x, y).passable() {
+                    sand.add(draw_param);
+                } else {
+                    rocks.add(draw_param);
                 }
             }
         }
 
-        let rocks = rocks.build(ctx)?;
-
+        graphics::draw(ctx, &sand, graphics::DrawParam::default())?;
         graphics::draw(ctx, &rocks, graphics::DrawParam::default())?;
 
         // Draw units
