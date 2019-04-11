@@ -31,12 +31,16 @@ Things I need to solve:
 * Gathering tiles
   * Worker unit (done!)
   * Tile unit
-  * Right-click map tile selector
-  * Pathfinding
-  * Proximity check
+  * Right-click map tile selector (done!)
+    * Hovering selector (done!)
+    * Requires knowing types of current selected units (done!)
+    * Mine (maybe a pickaxe or drill) icon
+  * Pathfinding (done!)
+  * Proximity check (done!)
   * Per-tile mining progress
   * Gathering GFX
-  * Map tile deletion, unit tile creation
+  * Map tile deletion (done!)
+  * Unit tile creation
 * Processing
   * Turn a tile into another kind of tile
   * Factory tile sprite

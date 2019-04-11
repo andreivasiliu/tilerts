@@ -9,6 +9,7 @@ struct MyGame {
     focus_color: f32,
     focused: bool,
     selecting: Option<(Point2<f32>, Point2<f32>)>,
+    pointing_at_tile: (usize, usize),
     units: Vec<Unit>,
     window_size: Vector2<f32>,
     game_map: GameMap,
@@ -34,8 +35,6 @@ const NEIGHBOURS: [(i32, i32); 8] = [
     (1, 1),
 ];
 
-
-
 const MAX_ELEVATION: f32 = -0.33;
 
 impl GameMap {
@@ -43,15 +42,33 @@ impl GameMap {
         &self.tiles[y * self.width + x]
     }
 
-    fn can_reach_neighbour(&self, source_x: i32, source_y: i32, x_offset: i32, y_offset: i32) -> bool {
+    fn tile_mut(&mut self, (x, y): (usize, usize)) -> &mut GroundTile {
+        &mut self.tiles[y * self.width + x]
+    }
+
+    fn can_reach_neighbour(
+        &self,
+        source_x: i32,
+        source_y: i32,
+        x_offset: i32,
+        y_offset: i32,
+    ) -> bool {
         let target_x = source_x + x_offset;
         let target_y = source_y + y_offset;
 
         // Check bounds
-        if source_x < 0 || source_y < 0 || source_x >= self.width as i32 || source_y >= self.height as i32 {
+        if source_x < 0
+            || source_y < 0
+            || source_x >= self.width as i32
+            || source_y >= self.height as i32
+        {
             return false;
         }
-        if target_x < 0 || target_y < 0 || target_x >= self.width as i32 || target_y >= self.height as i32 {
+        if target_x < 0
+            || target_y < 0
+            || target_x >= self.width as i32
+            || target_y >= self.height as i32
+        {
             return false;
         }
 
@@ -80,11 +97,6 @@ impl GameMap {
                 2 => 14, // ~= sqrt(2) * 10, diagonal of a square
                 _ => 10, // 1 * 10
             }
-        }
-
-        let current_tile = self.to_tile(target);
-        if !self.tile(current_tile.0, current_tile.1).passable() {
-            return Default::default();
         }
 
         pathfinding::directed::dijkstra::dijkstra_all(&(x, y), |(x, y)| {
@@ -157,16 +169,16 @@ impl GameMap {
 
 #[derive(Default, Clone)]
 struct GroundTile {
-    elevation: f32,
     /// The maximum unit size that can pass through this tile.
     /// 0 is impassable, 1 means the tile is free, 2 means this tile and all
     /// its neighbours are free, and so on.
     size: u8,
+    role: TileRole,
 }
 
 impl GroundTile {
     fn passable(&self) -> bool {
-        self.elevation <= MAX_ELEVATION
+        self.role == TileRole::Ground
     }
 }
 
@@ -187,8 +199,11 @@ impl MyGame {
 
         for y in 0..game_map.height {
             for x in 0..game_map.width {
-                game_map.tiles[y * game_map.width + x].elevation =
+                let elevation =
                     billow.get([x as f64 / 100.0, y as f64 / 100.0]) as f32;
+                if elevation > MAX_ELEVATION {
+                    game_map.tiles[y * game_map.width + x].role = TileRole::Rock;
+                }
             }
         }
 
@@ -202,7 +217,20 @@ impl MyGame {
             vehicle_image,
             sand_image,
             rock_image,
+            pointing_at_tile: (0, 0),
         })
+    }
+
+    fn pointing_at(&self, tile_role: TileRole) -> bool {
+        let pointing_at_rock = !self
+            .game_map
+            .tile(self.pointing_at_tile.0, self.pointing_at_tile.1)
+            .passable();
+
+        match tile_role {
+            TileRole::Ground => !pointing_at_rock,
+            TileRole::Rock => pointing_at_rock,
+        }
     }
 }
 
@@ -213,6 +241,8 @@ struct Unit {
     target: Option<Point2<f32>>,
     path: Option<Rc<HashMap<(i32, i32), Vector2<f32>>>>,
     selected: bool,
+    role: UnitRole,
+    action: UnitAction,
 }
 
 impl Unit {
@@ -222,6 +252,28 @@ impl Unit {
 
     fn speed(&self) -> f32 {
         5.0
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum UnitRole {
+    Worker,
+}
+
+enum UnitAction {
+    Normal,
+    Mining { tile: (usize, usize) },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TileRole {
+    Ground,
+    Rock,
+}
+
+impl Default for TileRole{
+    fn default() -> Self {
+        TileRole::Ground
     }
 }
 
@@ -264,19 +316,22 @@ fn draw_circle(
     Ok(())
 }
 
-fn interpolate_flow(flow: &HashMap<(i32, i32), Vector2<f32>>, point: Point2<f32>) -> Option<&Vector2<f32>> {
+fn interpolate_flow(
+    flow: &HashMap<(i32, i32), Vector2<f32>>,
+    point: Point2<f32>,
+) -> Option<&Vector2<f32>> {
     let current_tile = point / 16.0;
     let current_tile = Point2::new(current_tile.x.floor(), current_tile.y.floor());
-//    let position_within_tile = point - current_tile;
-//
-//    let neighbour_contribution = [f32; NEIGHBOURS.len()];
-//
-//    for (i, (x, y)) in NEIGHBOURS.iter().enumerate() {
-//
-//    }
-//    NEIGHBOURS.iter()
-//        .map(|(x_offset, y_offset)| (x_offset, y_offset, ))
-//        .map(|offset| ...);
+    //    let position_within_tile = point - current_tile;
+    //
+    //    let neighbour_contribution = [f32; NEIGHBOURS.len()];
+    //
+    //    for (i, (x, y)) in NEIGHBOURS.iter().enumerate() {
+    //
+    //    }
+    //    NEIGHBOURS.iter()
+    //        .map(|(x_offset, y_offset)| (x_offset, y_offset, ))
+    //        .map(|offset| ...);
 
     flow.get(&(current_tile.x as i32, current_tile.y as i32))
 }
@@ -292,7 +347,10 @@ impl EventHandler for MyGame {
         for unit in self.units.iter_mut() {
             if let (Some(target), Some(flow)) = (&unit.target, &unit.path) {
                 // Check direct line of sight, otherwise use the pre-computed Dijkstra flow
-                let direction = if self.game_map.raycast_to_target(unit, unit.position, *target) {
+                let direction = if self
+                    .game_map
+                    .raycast_to_target(unit, unit.position, *target)
+                {
                     (*target - unit.position).normalize()
                 } else {
                     match interpolate_flow(flow.as_ref(), unit.position) {
@@ -301,13 +359,34 @@ impl EventHandler for MyGame {
                             unit.intended_direction = None;
                             unit.target = None;
                             unit.path = None;
-                            continue
-                        },
+                            continue;
+                        }
                     }
                 };
 
                 // Check for non-permanent obstacles (other units)
                 // ???
+
+                // Mine
+                if let UnitAction::Mining { tile } = unit.action {
+                    let tile_position =
+                        Point2::new(tile.0 as f32 * 16.0 + 8.0, tile.1 as f32 * 16.0 + 8.0);
+                    let distance = (unit.position - tile_position).norm();
+
+                    if distance < 64.0 {
+                        unit.intended_direction = None;
+
+                        let tile = self.game_map.tile_mut(tile);
+                        if tile.role == TileRole::Rock {
+                            tile.role = TileRole::Ground;
+                        } else {
+                            unit.target = None;
+                            unit.path = None;
+                        }
+                        continue;
+                    }
+
+                }
 
                 // Move.
                 let path = target - unit.position;
@@ -402,6 +481,22 @@ impl EventHandler for MyGame {
             }
         }
 
+        // Draw actions
+        let selected_worker = self
+            .units
+            .iter()
+            .filter(|unit| unit.role == UnitRole::Worker)
+            .any(|unit| unit.selected);
+        let pointing_at_rock = self.pointing_at(TileRole::Rock);
+
+        if selected_worker && pointing_at_rock {
+            let rock_position = Point2::new(
+                self.pointing_at_tile.0 as f32 * 16.0 + 8.0,
+                self.pointing_at_tile.1 as f32 * 16.0 + 8.0,
+            );
+            draw_circle(ctx, rock_position, 5.0, graphics::BLACK, false)?;
+        }
+
         graphics::present(ctx)?;
 
         Ok(())
@@ -422,15 +517,25 @@ impl EventHandler for MyGame {
                 }
             }
         } else if button == MouseButton::Right {
-            let target = Point2::new(x, y);
+            let mut target = Point2::new(x, y);
+            let tile = self.game_map.to_tile(target);
 
             let path = Rc::new(self.game_map.path_flow_to_target(target));
+            let pointing_at_rock = self.pointing_at(TileRole::Rock);
 
-            for unit in self.units.iter_mut() {
-                if unit.selected {
-                    unit.target = Some(target);
-                    unit.path = Some(path.clone());
+            if pointing_at_rock {
+                target = Point2::new(tile.0 as f32 * 16.0 + 8.0, tile.1 as f32 * 16.0 + 8.0);
+            }
+
+            for selected_unit in self.units.iter_mut().filter(|unit| unit.selected) {
+                if pointing_at_rock && selected_unit.role == UnitRole::Worker {
+                    selected_unit.action = UnitAction::Mining { tile };
+                } else {
+                    selected_unit.action = UnitAction::Normal;
                 }
+
+                selected_unit.target = Some(target);
+                selected_unit.path = Some(path.clone());
             }
         }
     }
@@ -439,6 +544,8 @@ impl EventHandler for MyGame {
         if let Some((p1, _)) = self.selecting {
             self.selecting = Some((p1, Point2::new(x, y)));
         }
+
+        self.pointing_at_tile = self.game_map.to_tile(Point2::new(x, y));
     }
 
     fn focus_event(&mut self, _ctx: &mut Context, gained: bool) {
@@ -475,6 +582,8 @@ fn main() -> GameResult {
         selected: false,
         target: None,
         path: None,
+        role: UnitRole::Worker,
+        action: UnitAction::Normal,
     });
 
     my_game.units.push(Unit {
@@ -484,6 +593,8 @@ fn main() -> GameResult {
         selected: false,
         target: None,
         path: None,
+        role: UnitRole::Worker,
+        action: UnitAction::Normal,
     });
 
     event::run(&mut ctx, &mut event_loop, &mut my_game)?;
