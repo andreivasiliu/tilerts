@@ -10,12 +10,17 @@ struct MyGame {
     focused: bool,
     selecting: Option<(Point2<f32>, Point2<f32>)>,
     pointing_at_tile: (usize, usize),
+    pointing_at_unit: Option<()>,
     units: Vec<Unit>,
     window_size: Vector2<f32>,
     game_map: GameMap,
     vehicle_image: graphics::Image,
+    worker_base_image: graphics::Image,
+    worker_turret_image: graphics::Image,
     sand_image: graphics::Image,
-    rock_image: graphics::Image,
+    rock_images: [graphics::Image; 7],
+    mine_image: graphics::Image,
+    link_image: graphics::Image,
 }
 
 struct GameMap {
@@ -90,7 +95,7 @@ impl GameMap {
     }
 
     fn path_flow_to_target(&self, target: Point2<f32>) -> HashMap<(i32, i32), Vector2<f32>> {
-        let (x, y) = ((target.x / 16.0) as i32, (target.y / 16.0) as i32);
+        let (x, y) = ((target.x / 32.0) as i32, (target.y / 32.0) as i32);
 
         fn cost(x_offset: i32, y_offset: i32) -> u32 {
             match x_offset.abs() + y_offset.abs() {
@@ -149,7 +154,7 @@ impl GameMap {
     }
 
     fn to_tile(&self, point: Point2<f32>) -> (usize, usize) {
-        let (x, y) = ((point.x / 16.0).floor(), (point.y / 16.0).floor());
+        let (x, y) = ((point.x / 32.0).floor(), (point.y / 32.0).floor());
 
         let x = match x {
             i if i < 0.0 => 0,
@@ -174,6 +179,7 @@ struct GroundTile {
     /// its neighbours are free, and so on.
     size: u8,
     role: TileRole,
+    mining_progress: u8,
 }
 
 impl GroundTile {
@@ -185,8 +191,20 @@ impl GroundTile {
 impl MyGame {
     fn new(ctx: &mut Context) -> GameResult<Self> {
         let vehicle_image = graphics::Image::new(ctx, "/vehicle.png")?;
+        let worker_base_image = graphics::Image::new(ctx, "/worker_base.png")?;
+        let worker_turret_image = graphics::Image::new(ctx, "/worker_turret.png")?;
         let sand_image = graphics::Image::new(ctx, "/sand.png")?;
-        let rock_image = graphics::Image::new(ctx, "/rock.png")?;
+        let rock_images = [
+            graphics::Image::new(ctx, "/rock_sprite_1.png")?,
+            graphics::Image::new(ctx, "/rock_sprite_2.png")?,
+            graphics::Image::new(ctx, "/rock_sprite_3.png")?,
+            graphics::Image::new(ctx, "/rock_sprite_4.png")?,
+            graphics::Image::new(ctx, "/rock_sprite_5.png")?,
+            graphics::Image::new(ctx, "/rock_sprite_6.png")?,
+            graphics::Image::new(ctx, "/rock_sprite_7.png")?,
+        ];
+        let mine_image = graphics::Image::new(ctx, "/mine.png")?;
+        let link_image = graphics::Image::new(ctx, "/link.png")?;
 
         use noise::{Billow, NoiseFn};
         let billow = Billow::new();
@@ -199,8 +217,7 @@ impl MyGame {
 
         for y in 0..game_map.height {
             for x in 0..game_map.width {
-                let elevation =
-                    billow.get([x as f64 / 100.0, y as f64 / 100.0]) as f32;
+                let elevation = billow.get([x as f64 / 100.0, y as f64 / 100.0]) as f32;
                 if elevation > MAX_ELEVATION {
                     game_map.tiles[y * game_map.width + x].role = TileRole::Rock;
                 }
@@ -215,9 +232,14 @@ impl MyGame {
             window_size: Vector2::new(0.0, 0.0),
             game_map,
             vehicle_image,
+            worker_base_image,
+            worker_turret_image,
             sand_image,
-            rock_image,
+            rock_images,
+            mine_image,
+            link_image,
             pointing_at_tile: (0, 0),
+            pointing_at_unit: None,
         })
     }
 
@@ -231,6 +253,38 @@ impl MyGame {
             TileRole::Ground => !pointing_at_rock,
             TileRole::Rock => pointing_at_rock,
         }
+    }
+
+    fn draw_unit(&self, ctx: &mut Context, unit: &Unit) -> GameResult<()> {
+        // Draw base
+        let draw_param = graphics::DrawParam::new()
+            .offset(Point2::new(0.5, 0.5))
+            .rotation(to_angle(unit.rotation))
+            .dest(unit.position);
+
+        let unit_image = match unit.role {
+            UnitRole::Worker => &self.worker_base_image,
+            UnitRole::Ore => self.rock_images.last().unwrap(),
+        };
+        graphics::draw(ctx, unit_image, draw_param)?;
+
+        // Draw worker turret
+        if unit.role == UnitRole::Worker {
+            let rotation = if let UnitAction::Mining { tile, animation: _ } = unit.action {
+                (tile_center(tile) - unit.position).normalize()
+            } else {
+                unit.rotation
+            };
+
+            let draw_param = graphics::DrawParam::new()
+                .offset(Point2::new(0.5, 0.5))
+                .rotation(to_angle(rotation))
+                .dest(unit.position);
+
+            graphics::draw(ctx, &self.worker_turret_image, draw_param)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -258,11 +312,12 @@ impl Unit {
 #[derive(PartialEq, Eq)]
 enum UnitRole {
     Worker,
+    Ore,
 }
 
 enum UnitAction {
     Normal,
-    Mining { tile: (usize, usize) },
+    Mining { tile: (usize, usize), animation: u8 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -271,7 +326,7 @@ enum TileRole {
     Rock,
 }
 
-impl Default for TileRole{
+impl Default for TileRole {
     fn default() -> Self {
         TileRole::Ground
     }
@@ -290,6 +345,10 @@ fn to_angle(vector: Vector2<f32>) -> f32 {
 
 fn is_between(p: Point2<f32>, (p1, p2): (Point2<f32>, Point2<f32>)) -> bool {
     p.x >= p1.x && p.x <= p2.x && p.y >= p1.y && p.y <= p2.y
+}
+
+fn tile_center(tile: (usize, usize)) -> Point2<f32> {
+    Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0)
 }
 
 fn draw_circle(
@@ -320,7 +379,7 @@ fn interpolate_flow(
     flow: &HashMap<(i32, i32), Vector2<f32>>,
     point: Point2<f32>,
 ) -> Option<&Vector2<f32>> {
-    let current_tile = point / 16.0;
+    let current_tile = point / 32.0;
     let current_tile = Point2::new(current_tile.x.floor(), current_tile.y.floor());
     //    let position_within_tile = point - current_tile;
     //
@@ -343,6 +402,8 @@ impl EventHandler for MyGame {
         } else if !self.focused && self.focus_color > 0.2 {
             self.focus_color -= 0.01;
         }
+
+        let mut create_units = vec![];
 
         for unit in self.units.iter_mut() {
             if let (Some(target), Some(flow)) = (&unit.target, &unit.path) {
@@ -368,24 +429,40 @@ impl EventHandler for MyGame {
                 // ???
 
                 // Mine
-                if let UnitAction::Mining { tile } = unit.action {
+                if let UnitAction::Mining { tile, ref mut animation } = unit.action {
                     let tile_position =
-                        Point2::new(tile.0 as f32 * 16.0 + 8.0, tile.1 as f32 * 16.0 + 8.0);
+                        Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0);
                     let distance = (unit.position - tile_position).norm();
 
                     if distance < 64.0 {
                         unit.intended_direction = None;
+                        *animation = (*animation + 1) % 10;
 
                         let tile = self.game_map.tile_mut(tile);
                         if tile.role == TileRole::Rock {
-                            tile.role = TileRole::Ground;
+                            tile.mining_progress += 1;
+                            if tile.mining_progress > 80 {
+                                tile.mining_progress = 0;
+                                tile.role = TileRole::Ground;
+
+                                create_units.push(Unit {
+                                    position: tile_position,
+                                    rotation: Vector2::new(0.0, -1.0),
+                                    intended_direction: None,
+                                    selected: false,
+                                    target: None,
+                                    path: None,
+                                    role: UnitRole::Ore,
+                                    action: UnitAction::Normal,
+                                })
+                            }
                         } else {
+                            unit.action = UnitAction::Normal;
                             unit.target = None;
                             unit.path = None;
                         }
                         continue;
                     }
-
                 }
 
                 // Move.
@@ -407,6 +484,8 @@ impl EventHandler for MyGame {
             }
         }
 
+        self.units.extend(create_units);
+
         Ok(())
     }
 
@@ -415,33 +494,34 @@ impl EventHandler for MyGame {
 
         // Draw ground
         let mut sand = graphics::spritebatch::SpriteBatch::new(self.sand_image.clone());
-        let mut rocks = graphics::spritebatch::SpriteBatch::new(self.rock_image.clone());
+        let mut rocks: Vec<_> = (0..self.rock_images.len())
+            .map(|mining_level| {
+                graphics::spritebatch::SpriteBatch::new(self.rock_images[mining_level].clone())
+            })
+            .collect();
 
-        for x in 0..((self.window_size.x / 16.0) as usize) {
-            for y in 0..((self.window_size.y / 16.0) as usize) {
-                let draw_param = graphics::DrawParam::new()
-                    .scale(Vector2::new(0.5, 0.5))
-                    .dest(Point2::new(x as f32 * 16.0, y as f32 * 16.0));
+        for x in 0..((self.window_size.x / 32.0) as usize) {
+            for y in 0..((self.window_size.y / 32.0) as usize) {
+                let draw_param =
+                    graphics::DrawParam::new().dest(Point2::new(x as f32 * 32.0, y as f32 * 32.0));
 
-                if self.game_map.tile(x, y).passable() {
-                    sand.add(draw_param);
-                } else {
-                    rocks.add(draw_param);
+                sand.add(draw_param);
+
+                if !self.game_map.tile(x, y).passable() {
+                    let mining_level = self.game_map.tile(x, y).mining_progress / 10;
+                    rocks[mining_level.min(6) as usize].add(draw_param);
                 }
             }
         }
 
         graphics::draw(ctx, &sand, graphics::DrawParam::default())?;
-        graphics::draw(ctx, &rocks, graphics::DrawParam::default())?;
+        for rocks in rocks {
+            graphics::draw(ctx, &rocks, graphics::DrawParam::default())?;
+        }
 
         // Draw units
         for unit in self.units.iter() {
-            let draw_param = graphics::DrawParam::new()
-                .offset(Point2::new(0.5, 0.5))
-                .rotation(to_angle(unit.rotation))
-                .scale(Vector2::new(0.8, 0.8))
-                .dest(unit.position);
-            graphics::draw(ctx, &self.vehicle_image, draw_param)?;
+            self.draw_unit(ctx, unit)?;
 
             if unit.selected {
                 draw_circle(ctx, unit.position, 20.0, (0.2, 0.2, 0.6).into(), false)?;
@@ -481,7 +561,7 @@ impl EventHandler for MyGame {
             }
         }
 
-        // Draw actions
+        // Draw action intents
         let selected_worker = self
             .units
             .iter()
@@ -490,11 +570,39 @@ impl EventHandler for MyGame {
         let pointing_at_rock = self.pointing_at(TileRole::Rock);
 
         if selected_worker && pointing_at_rock {
-            let rock_position = Point2::new(
-                self.pointing_at_tile.0 as f32 * 16.0 + 8.0,
-                self.pointing_at_tile.1 as f32 * 16.0 + 8.0,
-            );
-            draw_circle(ctx, rock_position, 5.0, graphics::BLACK, false)?;
+            let draw_param = graphics::DrawParam::new()
+                .offset(Point2::new(0.5, 0.5))
+                .dest(tile_center(self.pointing_at_tile));
+            graphics::draw(ctx, &self.mine_image, draw_param)?;
+        }
+
+        // Draw mining effects
+        for unit in self.units.iter() {
+            if let UnitAction::Mining { tile, animation } = unit.action {
+                let tile_position = tile_center(tile);
+
+                let animation = 2.0 + (animation as i8 - 5).abs() as f32 / 3.0;
+
+                if (tile_position - unit.position).norm() < 64.0 {
+                    let mesh = graphics::Mesh::new_line(
+                        ctx,
+                        &[unit.position, tile_position],
+                        animation,
+                        (0.5, 0.5, 0.0).into(),
+                    )?;
+                    graphics::draw(ctx, &mesh, graphics::DrawParam::default())?;
+
+                    let mesh = graphics::Mesh::new_circle(
+                        ctx,
+                        graphics::DrawMode::fill(),
+                        tile_position,
+                        animation * 3.0,
+                        3.0,
+                        (0.5, 0.5, 0.0).into(),
+                    )?;
+                    graphics::draw(ctx, &mesh, graphics::DrawParam::default())?;
+                }
+            }
         }
 
         graphics::present(ctx)?;
@@ -524,12 +632,12 @@ impl EventHandler for MyGame {
             let pointing_at_rock = self.pointing_at(TileRole::Rock);
 
             if pointing_at_rock {
-                target = Point2::new(tile.0 as f32 * 16.0 + 8.0, tile.1 as f32 * 16.0 + 8.0);
+                target = Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0);
             }
 
             for selected_unit in self.units.iter_mut().filter(|unit| unit.selected) {
                 if pointing_at_rock && selected_unit.role == UnitRole::Worker {
-                    selected_unit.action = UnitAction::Mining { tile };
+                    selected_unit.action = UnitAction::Mining { tile, animation: 0 };
                 } else {
                     selected_unit.action = UnitAction::Normal;
                 }
@@ -541,11 +649,21 @@ impl EventHandler for MyGame {
     }
 
     fn mouse_motion_event(&mut self, _ctx: &mut Context, x: f32, y: f32, _dx: f32, _dy: f32) {
+        let pointing_at_point = Point2::new(x, y);
+
         if let Some((p1, _)) = self.selecting {
-            self.selecting = Some((p1, Point2::new(x, y)));
+            self.selecting = Some((p1, pointing_at_point));
         }
 
-        self.pointing_at_tile = self.game_map.to_tile(Point2::new(x, y));
+        self.pointing_at_tile = self.game_map.to_tile(pointing_at_point);
+
+        self.pointing_at_unit = None;
+
+        for unit in self.units.iter() {
+            if (unit.position - pointing_at_point).norm() < 32.0 {
+                self.pointing_at_unit = Some(());  // ???
+            }
+        }
     }
 
     fn focus_event(&mut self, _ctx: &mut Context, gained: bool) {

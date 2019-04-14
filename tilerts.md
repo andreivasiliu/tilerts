@@ -25,9 +25,29 @@ Things I need to solve:
 
 * What's the MVP?
   * Still have no clue.
+  * So far I made reverse Dijsktra and line-of-sight pathing, but I don't know how to do unit-unit collision.
+  * Found some really good stuff on [GameAIPro](http://www.gameaipro.com/GameAIPro/GameAIPro_Chapter23_Crowd_Pathfinding_and_Steering_Using_Flow_Field_Tiles.pdf).
 
 ### Structures
 
+Story:
+* worker mines rock, which becomes ore on the ground
+* worker processes the ore tile unit into a factory tile unit
+* player draws a multi-tile factory on the ground (how? dunno)
+* worker processes ground tiles into specific shapes (which? dunno)
+* worker tows the factory tile into a factory slot (how? dunno)
+* if the factory slot has a factory tile, and is surrounded by the correctly terraformed terrain, it acts as a Factory structure
+
+Factory:
+```
+f^.  Legend:
+Fof   f - factory shape
+f^.   F - factory shape (requires factory unit slotted into it)
+      ^ - conveyor maybe?
+      . - ground
+```
+
+Details:
 * Gathering tiles
   * Worker unit (done!)
   * Tile unit
@@ -37,10 +57,10 @@ Things I need to solve:
     * Mine (maybe a pickaxe or drill) icon
   * Pathfinding (done!)
   * Proximity check (done!)
-  * Per-tile mining progress
-  * Gathering GFX
+  * Per-tile mining progress (done!)
+  * Gathering GFX (done!)
   * Map tile deletion (done!)
-  * Unit tile creation
+  * Unit tile creation (done!)
 * Processing
   * Turn a tile into another kind of tile
   * Factory tile sprite
