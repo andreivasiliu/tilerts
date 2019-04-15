@@ -10,7 +10,7 @@ struct MyGame {
     focused: bool,
     selecting: Option<(Point2<f32>, Point2<f32>)>,
     pointing_at_tile: (usize, usize),
-    pointing_at_unit: Option<()>,
+    pointing_at_unit: Option<UnitId>,
     units: Vec<Unit>,
     window_size: Vector2<f32>,
     game_map: GameMap,
@@ -270,7 +270,7 @@ impl MyGame {
 
         // Draw worker turret
         if unit.role == UnitRole::Worker {
-            let rotation = if let UnitAction::Mining { tile, animation: _ } = unit.action {
+            let rotation = if let UnitAction::Mining { tile, active: _, animation: _ } = unit.action {
                 (tile_center(tile) - unit.position).normalize()
             } else {
                 unit.rotation
@@ -286,9 +286,29 @@ impl MyGame {
 
         Ok(())
     }
+
+    fn pointing_at_unit(&self) -> Option<&Unit> {
+        for unit in self.units.iter() {
+            if Some(&unit.id) == self.pointing_at_unit.as_ref() {
+                return Some(unit);
+            }
+        }
+
+        None
+    }
+
+    fn unit_with_id(&self, id: &UnitId) -> Option<usize> {
+        for (u, unit) in self.units.iter().enumerate() {
+            if &unit.id == id {
+                return Some(u);
+            }
+        }
+        None
+    }
 }
 
 struct Unit {
+    id: UnitId,
     position: Point2<f32>,
     rotation: Vector2<f32>,
     intended_direction: Option<Vector2<f32>>,
@@ -297,6 +317,8 @@ struct Unit {
     selected: bool,
     role: UnitRole,
     action: UnitAction,
+    hooking_unit: Option<UnitId>,
+    being_hooked_by: Option<UnitId>,
 }
 
 impl Unit {
@@ -309,15 +331,26 @@ impl Unit {
     }
 }
 
+#[derive(Default, Debug, Eq, Clone)]
+struct UnitId(Rc<()>);
+
+impl PartialEq for UnitId {
+    fn eq(&self, other: &UnitId) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum UnitRole {
     Worker,
     Ore,
 }
 
+#[derive(Debug)]
 enum UnitAction {
     Normal,
-    Mining { tile: (usize, usize), animation: u8 },
+    Mining { tile: (usize, usize), active: bool, animation: u8 },
+    StartHooking { hook_unit: UnitId },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -405,38 +438,79 @@ impl EventHandler for MyGame {
 
         let mut create_units = vec![];
 
-        for unit in self.units.iter_mut() {
-            if let (Some(target), Some(flow)) = (&unit.target, &unit.path) {
+        for u in 0..self.units.len() {
+            // Tow things hooked to this unit.
+            if let Some(ref hooking_unit) = self.units[u].hooking_unit {
+                match self.unit_with_id(hooking_unit) {
+                    Some(h) => {
+                        let distance = self.units[h].position - self.units[u].position;
+
+                        if distance.norm() > 32.0 {
+                            self.units[h].position -= distance.normalize() * 6.0;
+                        }
+                    },
+                    None => {
+                        // The unit disappeared! Stop hooking it.
+                        self.units[u].hooking_unit = None;
+                    }
+                }
+            }
+
+            // Units that are hooked cannot act.
+            if self.units[u].being_hooked_by.is_some() {
+                continue;
+            }
+
+            let (direction, target) = {
+                let unit = &mut self.units[u];
+
                 // Check direct line of sight, otherwise use the pre-computed Dijkstra flow
-                let direction = if self
-                    .game_map
-                    .raycast_to_target(unit, unit.position, *target)
-                {
-                    (*target - unit.position).normalize()
-                } else {
-                    match interpolate_flow(flow.as_ref(), unit.position) {
-                        Some(x) => x.clone(),
-                        None => {
-                            unit.intended_direction = None;
-                            unit.target = None;
-                            unit.path = None;
-                            continue;
+                if let (Some(target), Some(flow)) = (&unit.target, &unit.path) {
+                    if self
+                        .game_map
+                        .raycast_to_target(unit, unit.position, *target)
+                    {
+                        ((*target - unit.position).normalize(), target.clone())
+                    } else {
+                        match interpolate_flow(flow.as_ref(), unit.position) {
+                            Some(flow_direction) => (flow_direction.clone(), target.clone()),
+                            None => {
+                                unit.intended_direction = None;
+                                unit.target = None;
+                                unit.path = None;
+                                continue;
+                            }
                         }
                     }
-                };
+                } else {
+                    continue;
+                }
+            };
 
-                // Check for non-permanent obstacles (other units)
-                // ???
+            // Check for non-permanent obstacles (other units)
+            // ???
 
+            match self.units[u].action {
                 // Mine
-                if let UnitAction::Mining { tile, ref mut animation } = unit.action {
+                UnitAction::Mining {
+                    tile,
+                    active: _,
+                    animation,
+                } => {
+                    let unit = &mut self.units[u];
+
                     let tile_position =
                         Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0);
                     let distance = (unit.position - tile_position).norm();
 
                     if distance < 64.0 {
                         unit.intended_direction = None;
-                        *animation = (*animation + 1) % 10;
+
+                        unit.action = UnitAction::Mining {
+                            tile,
+                            active: true,
+                            animation: (animation + 1) % 10,
+                        };
 
                         let tile = self.game_map.tile_mut(tile);
                         if tile.role == TileRole::Rock {
@@ -446,6 +520,7 @@ impl EventHandler for MyGame {
                                 tile.role = TileRole::Ground;
 
                                 create_units.push(Unit {
+                                    id: UnitId::default(),
                                     position: tile_position,
                                     rotation: Vector2::new(0.0, -1.0),
                                     intended_direction: None,
@@ -454,6 +529,8 @@ impl EventHandler for MyGame {
                                     path: None,
                                     role: UnitRole::Ore,
                                     action: UnitAction::Normal,
+                                    hooking_unit: None,
+                                    being_hooked_by: None,
                                 })
                             }
                         } else {
@@ -462,18 +539,75 @@ impl EventHandler for MyGame {
                             unit.path = None;
                         }
                         continue;
+                    } else {
+                        unit.action = UnitAction::Mining {
+                            tile,
+                            active: false,
+                            animation: 0,
+                        };
                     }
-                }
+                },
 
-                // Move.
-                let path = target - unit.position;
-                if path.norm() > 10.0 {
-                    unit.intended_direction = Some(direction);
-                } else {
-                    unit.intended_direction = None;
-                    unit.target = None;
-                    unit.path = None;
-                }
+                // Go hook something.
+                UnitAction::StartHooking { ref hook_unit } => {
+                    let hooking_unit = hook_unit.clone();
+
+                    let stop_unit = match self.unit_with_id(hook_unit) {
+                        Some(h) => {
+                            let distance = (self.units[u].position - self.units[h].position).norm();
+
+                            if let Some(ref already_hooked_by_unit) = self.units[h].being_hooked_by {
+                                if let Some(u2) = self.unit_with_id(already_hooked_by_unit) {
+                                    self.units[u2].hooking_unit = None;
+                                }
+                            }
+
+                            if distance < 64.0 {
+                                self.units[u].action = UnitAction::Normal;
+                                if let Some(ref already_hooking_unit) = self.units[u].hooking_unit {
+                                    if let Some(h2) = self.unit_with_id(already_hooking_unit) {
+                                        self.units[h2].being_hooked_by = None;
+                                    }
+                                }
+                                self.units[u].hooking_unit = Some(hooking_unit);
+
+                                self.units[h].being_hooked_by = Some(self.units[u].id.clone());
+
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                        None => {
+                            // The unit disappeared! Stop hooking it.
+                            self.units[u].action = UnitAction::Normal;
+                            true
+                        }
+                    };
+
+                    if stop_unit {
+                        let unit = &mut self.units[u];
+                        unit.target = None;
+                        unit.path = None;
+                        unit.intended_direction = None;
+                        continue;
+                    }
+                },
+
+                // Do nothing special
+                UnitAction::Normal => (),
+            }
+
+            let unit = &mut self.units[u];
+
+            // Move.
+            let path = target - unit.position;
+            if path.norm() > 10.0 {
+                unit.intended_direction = Some(direction);
+            } else {
+                unit.intended_direction = None;
+                unit.target = None;
+                unit.path = None;
             }
         }
 
@@ -524,7 +658,7 @@ impl EventHandler for MyGame {
             self.draw_unit(ctx, unit)?;
 
             if unit.selected {
-                draw_circle(ctx, unit.position, 20.0, (0.2, 0.2, 0.6).into(), false)?;
+                draw_circle(ctx, unit.position, 20.0, (0.6, 0.6, 0.8, 0.6).into(), false)?;
             }
 
             if let Some(target) = unit.target {
@@ -559,6 +693,15 @@ impl EventHandler for MyGame {
             {
                 draw_circle(ctx, unit.position, 20.0, graphics::BLACK, false)?;
             }
+        } else {
+            if let Some(pointing_at_unit) = self
+                .units
+                .iter()
+                .filter(|unit| Some(&unit.id) == self.pointing_at_unit.as_ref())
+                .nth(0)
+            {
+                draw_circle(ctx, pointing_at_unit.position, 20.0, graphics::BLACK, false)?;
+            }
         }
 
         // Draw action intents
@@ -567,18 +710,24 @@ impl EventHandler for MyGame {
             .iter()
             .filter(|unit| unit.role == UnitRole::Worker)
             .any(|unit| unit.selected);
-        let pointing_at_rock = self.pointing_at(TileRole::Rock);
 
-        if selected_worker && pointing_at_rock {
-            let draw_param = graphics::DrawParam::new()
-                .offset(Point2::new(0.5, 0.5))
-                .dest(tile_center(self.pointing_at_tile));
-            graphics::draw(ctx, &self.mine_image, draw_param)?;
+        if selected_worker {
+            if self.pointing_at(TileRole::Rock) {
+                let draw_param = graphics::DrawParam::new()
+                    .offset(Point2::new(0.5, 0.5))
+                    .dest(tile_center(self.pointing_at_tile));
+                graphics::draw(ctx, &self.mine_image, draw_param)?;
+            } else if let Some(pointing_at_unit) = self.pointing_at_unit() {
+                let draw_param = graphics::DrawParam::new()
+                    .offset(Point2::new(0.5, 0.5))
+                    .dest(pointing_at_unit.position);
+                graphics::draw(ctx, &self.link_image, draw_param)?;
+            }
         }
 
         // Draw mining effects
         for unit in self.units.iter() {
-            if let UnitAction::Mining { tile, animation } = unit.action {
+            if let UnitAction::Mining { tile, active: true, animation } = unit.action {
                 let tile_position = tile_center(tile);
 
                 let animation = 2.0 + (animation as i8 - 5).abs() as f32 / 3.0;
@@ -613,17 +762,6 @@ impl EventHandler for MyGame {
     fn mouse_button_down_event(&mut self, _ctx: &mut Context, button: MouseButton, x: f32, y: f32) {
         if button == MouseButton::Left && x > 0.0 && y > 0.0 {
             self.selecting = Some((Point2::new(x, y), Point2::new(x, y)));
-        }
-    }
-
-    fn mouse_button_up_event(&mut self, _ctx: &mut Context, button: MouseButton, x: f32, y: f32) {
-        if button == MouseButton::Left {
-            if let Some((p1, p2)) = self.selecting.take() {
-                let (point, size) = to_rect(p1, p2);
-                for unit in self.units.iter_mut() {
-                    unit.selected = unit.selected_by(point, size);
-                }
-            }
         } else if button == MouseButton::Right {
             let mut target = Point2::new(x, y);
             let tile = self.game_map.to_tile(target);
@@ -633,17 +771,53 @@ impl EventHandler for MyGame {
 
             if pointing_at_rock {
                 target = Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0);
+            } else if let Some(pointing_at_unit) = self.pointing_at_unit() {
+                target = pointing_at_unit.position;
             }
 
             for selected_unit in self.units.iter_mut().filter(|unit| unit.selected) {
-                if pointing_at_rock && selected_unit.role == UnitRole::Worker {
-                    selected_unit.action = UnitAction::Mining { tile, animation: 0 };
-                } else {
-                    selected_unit.action = UnitAction::Normal;
+                if selected_unit.role == UnitRole::Worker {
+                    if pointing_at_rock {
+                        selected_unit.action = UnitAction::Mining { tile, active: false, animation: 0 };
+                    } else if let Some(ref pointing_at_unit) = self.pointing_at_unit {
+                        if pointing_at_unit == &selected_unit.id {
+                            // Don't hook self.
+                            selected_unit.action = UnitAction::Normal;
+                        } else {
+                            selected_unit.action = UnitAction::StartHooking {
+                                hook_unit: pointing_at_unit.clone(),
+                            };
+                        }
+                    } else {
+                        selected_unit.action = UnitAction::Normal;
+                    }
                 }
 
                 selected_unit.target = Some(target);
                 selected_unit.path = Some(path.clone());
+            }
+        }
+    }
+
+    fn mouse_button_up_event(&mut self, _ctx: &mut Context, button: MouseButton, _x: f32, _y: f32) {
+        if button == MouseButton::Left {
+            if let Some((p1, p2)) = self.selecting.take() {
+                if (p1 - p2).norm() > 3.0 {
+                    // Drag-select.
+                    let (point, size) = to_rect(p1, p2);
+                    for unit in self.units.iter_mut() {
+                        unit.selected = unit.selected_by(point, size);
+                    }
+                } else {
+                    // Click-select.
+                    for unit in self.units.iter_mut() {
+                        if let Some(ref pointing_at_unit) = self.pointing_at_unit {
+                            unit.selected = &unit.id == pointing_at_unit;
+                        } else {
+                            unit.selected = false;
+                        }
+                    }
+                }
             }
         }
     }
@@ -660,8 +834,8 @@ impl EventHandler for MyGame {
         self.pointing_at_unit = None;
 
         for unit in self.units.iter() {
-            if (unit.position - pointing_at_point).norm() < 32.0 {
-                self.pointing_at_unit = Some(());  // ???
+            if (unit.position - pointing_at_point).norm() < 24.0 {
+                self.pointing_at_unit = Some(unit.id.clone());
             }
         }
     }
@@ -694,6 +868,7 @@ fn main() -> GameResult {
     let mut my_game = MyGame::new(&mut ctx)?;
 
     my_game.units.push(Unit {
+        id: UnitId::default(),
         position: Point2::new(200.0, 200.0),
         rotation: Vector2::new(0.0, -1.0),
         intended_direction: None,
@@ -702,9 +877,12 @@ fn main() -> GameResult {
         path: None,
         role: UnitRole::Worker,
         action: UnitAction::Normal,
+        hooking_unit: None,
+        being_hooked_by: None,
     });
 
     my_game.units.push(Unit {
+        id: UnitId::default(),
         position: Point2::new(300.0, 600.0),
         rotation: Vector2::new(0.0, -1.0),
         intended_direction: None,
@@ -713,6 +891,8 @@ fn main() -> GameResult {
         path: None,
         role: UnitRole::Worker,
         action: UnitAction::Normal,
+        hooking_unit: None,
+        being_hooked_by: None,
     });
 
     event::run(&mut ctx, &mut event_loop, &mut my_game)?;
