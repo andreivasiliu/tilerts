@@ -8,17 +8,20 @@ use std::rc::Rc;
 struct MyGame {
     focus_color: f32,
     focused: bool,
+    build_menu: bool,
     selecting: Option<(Point2<f32>, Point2<f32>)>,
     pointing_at_tile: (usize, usize),
     pointing_at_unit: Option<UnitId>,
     units: Vec<Unit>,
     window_size: Vector2<f32>,
     game_map: GameMap,
-    vehicle_image: graphics::Image,
+    conveyor_animation: usize,
     worker_base_image: graphics::Image,
     worker_turret_image: graphics::Image,
     sand_image: graphics::Image,
-    rock_images: [graphics::Image; 7],
+    rock_images: Vec<graphics::Image>,
+    conveyor_images: Vec<graphics::Image>,
+    conveyor_ghost_image: graphics::Image,
     mine_image: graphics::Image,
     link_image: graphics::Image,
 }
@@ -179,30 +182,36 @@ struct GroundTile {
     /// its neighbours are free, and so on.
     size: u8,
     role: TileRole,
+    build_plan: Option<TileRole>,
     mining_progress: u8,
 }
 
 impl GroundTile {
     fn passable(&self) -> bool {
-        self.role == TileRole::Ground
+        self.role == TileRole::Ground || self.role == TileRole::Conveyor
     }
 }
 
 impl MyGame {
     fn new(ctx: &mut Context) -> GameResult<Self> {
-        let vehicle_image = graphics::Image::new(ctx, "/vehicle.png")?;
         let worker_base_image = graphics::Image::new(ctx, "/worker_base.png")?;
         let worker_turret_image = graphics::Image::new(ctx, "/worker_turret.png")?;
         let sand_image = graphics::Image::new(ctx, "/sand.png")?;
-        let rock_images = [
-            graphics::Image::new(ctx, "/rock_sprite_1.png")?,
-            graphics::Image::new(ctx, "/rock_sprite_2.png")?,
-            graphics::Image::new(ctx, "/rock_sprite_3.png")?,
-            graphics::Image::new(ctx, "/rock_sprite_4.png")?,
-            graphics::Image::new(ctx, "/rock_sprite_5.png")?,
-            graphics::Image::new(ctx, "/rock_sprite_6.png")?,
-            graphics::Image::new(ctx, "/rock_sprite_7.png")?,
-        ];
+        let mut rock_images = vec![];
+        for frame in 1..=7 {
+            rock_images.push(graphics::Image::new(
+                ctx,
+                format!("/rock_sprite_{}.png", frame),
+            )?);
+        }
+        let mut conveyor_images = vec![];
+        for frame in 0..=13 {
+            conveyor_images.push(graphics::Image::new(
+                ctx,
+                format!("/conveyor_straight_{:02}.png", frame),
+            )?);
+        }
+        let conveyor_ghost_image = graphics::Image::new(ctx, "/conveyor_straight_ghost.png")?;
         let mine_image = graphics::Image::new(ctx, "/mine.png")?;
         let link_image = graphics::Image::new(ctx, "/link.png")?;
 
@@ -227,15 +236,18 @@ impl MyGame {
         Ok(Self {
             focus_color: 0.2,
             focused: true,
+            build_menu: false,
             selecting: None,
             units: Vec::default(),
             window_size: Vector2::new(0.0, 0.0),
             game_map,
-            vehicle_image,
+            conveyor_animation: 0,
             worker_base_image,
             worker_turret_image,
             sand_image,
             rock_images,
+            conveyor_images,
+            conveyor_ghost_image,
             mine_image,
             link_image,
             pointing_at_tile: (0, 0),
@@ -244,15 +256,10 @@ impl MyGame {
     }
 
     fn pointing_at(&self, tile_role: TileRole) -> bool {
-        let pointing_at_rock = !self
-            .game_map
+        self.game_map
             .tile(self.pointing_at_tile.0, self.pointing_at_tile.1)
-            .passable();
-
-        match tile_role {
-            TileRole::Ground => !pointing_at_rock,
-            TileRole::Rock => pointing_at_rock,
-        }
+            .role
+            == tile_role
     }
 
     fn draw_unit(&self, ctx: &mut Context, unit: &Unit) -> GameResult<()> {
@@ -270,7 +277,12 @@ impl MyGame {
 
         // Draw worker turret
         if unit.role == UnitRole::Worker {
-            let rotation = if let UnitAction::Mining { tile, active: _, animation: _ } = unit.action {
+            let rotation = if let UnitAction::Mining {
+                tile,
+                active: _,
+                animation: _,
+            } = unit.action
+            {
                 (tile_center(tile) - unit.position).normalize()
             } else {
                 unit.rotation
@@ -349,14 +361,25 @@ enum UnitRole {
 #[derive(Debug)]
 enum UnitAction {
     Normal,
-    Mining { tile: (usize, usize), active: bool, animation: u8 },
-    StartHooking { hook_unit: UnitId },
+    Mining {
+        tile: (usize, usize),
+        active: bool,
+        animation: u8,
+    },
+    Building {
+        tile: (usize, usize),
+    },
+    StartHooking {
+        hook_unit: UnitId,
+    },
+    StopHooking,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TileRole {
     Ground,
     Rock,
+    Conveyor,
 }
 
 impl Default for TileRole {
@@ -436,6 +459,8 @@ impl EventHandler for MyGame {
             self.focus_color -= 0.01;
         }
 
+        self.conveyor_animation = (self.conveyor_animation + 1) % (self.conveyor_images.len() * 3);
+
         let mut create_units = vec![];
 
         for u in 0..self.units.len() {
@@ -444,11 +469,12 @@ impl EventHandler for MyGame {
                 match self.unit_with_id(hooking_unit) {
                     Some(h) => {
                         let distance = self.units[h].position - self.units[u].position;
+                        let speed = self.units[u].speed();
 
                         if distance.norm() > 32.0 {
-                            self.units[h].position -= distance.normalize() * 6.0;
+                            self.units[h].position -= distance.normalize() * speed;
                         }
-                    },
+                    }
                     None => {
                         // The unit disappeared! Stop hooking it.
                         self.units[u].hooking_unit = None;
@@ -459,6 +485,12 @@ impl EventHandler for MyGame {
             // Units that are hooked cannot act.
             if self.units[u].being_hooked_by.is_some() {
                 continue;
+            }
+
+            // Move on conveyors.
+            let tile = self.game_map.to_tile(self.units[u].position);
+            if self.game_map.tile(tile.0, tile.1).role == TileRole::Conveyor {
+                self.units[u].position += Vector2::new(0.0, -0.7);
             }
 
             let (direction, target) = {
@@ -499,8 +531,7 @@ impl EventHandler for MyGame {
                 } => {
                     let unit = &mut self.units[u];
 
-                    let tile_position =
-                        Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0);
+                    let tile_position = tile_center(tile);
                     let distance = (unit.position - tile_position).norm();
 
                     if distance < 64.0 {
@@ -546,7 +577,29 @@ impl EventHandler for MyGame {
                             animation: 0,
                         };
                     }
-                },
+                }
+
+                // Build.
+                UnitAction::Building { tile } => {
+                    let unit = &mut self.units[u];
+
+                    let distance = (unit.position - tile_center(tile)).norm();
+
+                    if distance < 64.0 {
+                        let tile = self.game_map.tile_mut(tile);
+                        if let Some(build_plan) = tile.build_plan {
+                            tile.role = build_plan;
+                            tile.build_plan = None;
+                        }
+
+                        unit.action = UnitAction::Normal;
+                        unit.target = None;
+                        unit.path = None;
+                        unit.intended_direction = None;
+
+                        continue;
+                    }
+                }
 
                 // Go hook something.
                 UnitAction::StartHooking { ref hook_unit } => {
@@ -556,7 +609,8 @@ impl EventHandler for MyGame {
                         Some(h) => {
                             let distance = (self.units[u].position - self.units[h].position).norm();
 
-                            if let Some(ref already_hooked_by_unit) = self.units[h].being_hooked_by {
+                            if let Some(ref already_hooked_by_unit) = self.units[h].being_hooked_by
+                            {
                                 if let Some(u2) = self.unit_with_id(already_hooked_by_unit) {
                                     self.units[u2].hooking_unit = None;
                                 }
@@ -577,7 +631,7 @@ impl EventHandler for MyGame {
                             } else {
                                 false
                             }
-                        },
+                        }
                         None => {
                             // The unit disappeared! Stop hooking it.
                             self.units[u].action = UnitAction::Normal;
@@ -592,7 +646,25 @@ impl EventHandler for MyGame {
                         unit.intended_direction = None;
                         continue;
                     }
-                },
+                }
+
+                UnitAction::StopHooking => {
+                    if let Some(ref hooking_unit) = self.units[u].hooking_unit {
+                        match self.unit_with_id(hooking_unit) {
+                            Some(h) => {
+                                self.units[h].being_hooked_by = None;
+                            }
+                            None => (),
+                        }
+                    }
+
+                    let unit = &mut self.units[u];
+                    unit.hooking_unit = None;
+                    unit.target = None;
+                    unit.path = None;
+                    unit.intended_direction = None;
+                    continue;
+                }
 
                 // Do nothing special
                 UnitAction::Normal => (),
@@ -653,6 +725,38 @@ impl EventHandler for MyGame {
             graphics::draw(ctx, &rocks, graphics::DrawParam::default())?;
         }
 
+        // Draw structures and build plans
+        for x in 0..((self.window_size.x / 32.0) as usize) {
+            for y in 0..((self.window_size.y / 32.0) as usize) {
+                let tile = self.game_map.tile(x, y);
+                match tile.role {
+                    TileRole::Ground => (),
+                    TileRole::Rock => (),
+                    TileRole::Conveyor => {
+                        let draw_param = graphics::DrawParam::new()
+                            .offset(Point2::new(0.5, 0.5))
+                            .dest(tile_center((x, y)));
+                        graphics::draw(
+                            ctx,
+                            &self.conveyor_images[self.conveyor_animation / 3],
+                            draw_param,
+                        )?;
+                    }
+                }
+
+                match tile.build_plan {
+                    Some(TileRole::Conveyor) => {
+                        let draw_param = graphics::DrawParam::new()
+                            .offset(Point2::new(0.5, 0.5))
+                            .dest(tile_center((x, y)))
+                            .color((1.0, 1.0, 1.0, 0.3).into());
+                        graphics::draw(ctx, &self.conveyor_ghost_image, draw_param)?;
+                    }
+                    _ => (),
+                }
+            }
+        }
+
         // Draw units
         for unit in self.units.iter() {
             self.draw_unit(ctx, unit)?;
@@ -700,7 +804,13 @@ impl EventHandler for MyGame {
                 .filter(|unit| Some(&unit.id) == self.pointing_at_unit.as_ref())
                 .nth(0)
             {
-                draw_circle(ctx, pointing_at_unit.position, 20.0, graphics::BLACK, false)?;
+                draw_circle(
+                    ctx,
+                    pointing_at_unit.position,
+                    20.0,
+                    (0.0, 0.0, 0.0, 0.3).into(),
+                    false,
+                )?;
             }
         }
 
@@ -725,9 +835,23 @@ impl EventHandler for MyGame {
             }
         }
 
+        // Draw build ghosts
+        if self.build_menu && self.pointing_at(TileRole::Ground) {
+            let draw_param = graphics::DrawParam::new()
+                .offset(Point2::new(0.5, 0.5))
+                .dest(tile_center(self.pointing_at_tile))
+                .color((1.0, 1.0, 1.0, 0.5).into());
+            graphics::draw(ctx, &self.conveyor_ghost_image, draw_param)?;
+        }
+
         // Draw mining effects
         for unit in self.units.iter() {
-            if let UnitAction::Mining { tile, active: true, animation } = unit.action {
+            if let UnitAction::Mining {
+                tile,
+                active: true,
+                animation,
+            } = unit.action
+            {
                 let tile_position = tile_center(tile);
 
                 let animation = 2.0 + (animation as i8 - 5).abs() as f32 / 3.0;
@@ -754,6 +878,20 @@ impl EventHandler for MyGame {
             }
         }
 
+        // Draw hooking/towing effects
+        for u in 0..self.units.len() {
+            if let Some(ref hooking_unit) = self.units[u].hooking_unit {
+                if let Some(h) = self.unit_with_id(hooking_unit) {
+                    let p1 = self.units[u].position;
+                    let p2 = self.units[h].position;
+
+                    let mesh =
+                        graphics::Mesh::new_line(ctx, &[p1, p2], 2.0, (0.4, 0.4, 1.0, 0.5).into())?;
+                    graphics::draw(ctx, &mesh, graphics::DrawParam::default())?;
+                }
+            }
+        }
+
         graphics::present(ctx)?;
 
         Ok(())
@@ -761,33 +899,50 @@ impl EventHandler for MyGame {
 
     fn mouse_button_down_event(&mut self, _ctx: &mut Context, button: MouseButton, x: f32, y: f32) {
         if button == MouseButton::Left && x > 0.0 && y > 0.0 {
-            self.selecting = Some((Point2::new(x, y), Point2::new(x, y)));
+            if self.build_menu && self.pointing_at(TileRole::Ground) {
+                self.game_map.tile_mut(self.pointing_at_tile).build_plan = Some(TileRole::Conveyor);
+            } else {
+                self.selecting = Some((Point2::new(x, y), Point2::new(x, y)));
+            }
         } else if button == MouseButton::Right {
             let mut target = Point2::new(x, y);
             let tile = self.game_map.to_tile(target);
 
             let path = Rc::new(self.game_map.path_flow_to_target(target));
             let pointing_at_rock = self.pointing_at(TileRole::Rock);
+            let pointing_at_build_plan = self.game_map.tile(tile.0, tile.1).build_plan;
 
             if pointing_at_rock {
-                target = Point2::new(tile.0 as f32 * 32.0 + 16.0, tile.1 as f32 * 32.0 + 16.0);
+                target = tile_center(tile);
             } else if let Some(pointing_at_unit) = self.pointing_at_unit() {
                 target = pointing_at_unit.position;
+            } else if pointing_at_build_plan.is_some() {
+                target = tile_center(tile);
             }
 
             for selected_unit in self.units.iter_mut().filter(|unit| unit.selected) {
                 if selected_unit.role == UnitRole::Worker {
                     if pointing_at_rock {
-                        selected_unit.action = UnitAction::Mining { tile, active: false, animation: 0 };
+                        selected_unit.action = UnitAction::Mining {
+                            tile,
+                            active: false,
+                            animation: 0,
+                        };
                     } else if let Some(ref pointing_at_unit) = self.pointing_at_unit {
                         if pointing_at_unit == &selected_unit.id {
                             // Don't hook self.
                             selected_unit.action = UnitAction::Normal;
                         } else {
-                            selected_unit.action = UnitAction::StartHooking {
-                                hook_unit: pointing_at_unit.clone(),
-                            };
+                            if selected_unit.hooking_unit.as_ref() == Some(pointing_at_unit) {
+                                selected_unit.action = UnitAction::StopHooking;
+                            } else {
+                                selected_unit.action = UnitAction::StartHooking {
+                                    hook_unit: pointing_at_unit.clone(),
+                                };
+                            }
                         }
+                    } else if pointing_at_build_plan.is_some() {
+                        selected_unit.action = UnitAction::Building { tile };
                     } else {
                         selected_unit.action = UnitAction::Normal;
                     }
@@ -837,6 +992,20 @@ impl EventHandler for MyGame {
             if (unit.position - pointing_at_point).norm() < 24.0 {
                 self.pointing_at_unit = Some(unit.id.clone());
             }
+        }
+    }
+
+    fn key_down_event(
+        &mut self,
+        ctx: &mut Context,
+        keycode: ggez::input::keyboard::KeyCode,
+        _keymods: ggez::input::keyboard::KeyMods,
+        _repeat: bool,
+    ) {
+        if keycode == ggez::input::keyboard::KeyCode::Escape {
+            ggez::quit(ctx);
+        } else if keycode == ggez::input::keyboard::KeyCode::B {
+            self.build_menu = !self.build_menu;
         }
     }
 
