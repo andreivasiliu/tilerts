@@ -8,7 +8,7 @@ use std::rc::Rc;
 struct MyGame {
     focus_color: f32,
     focused: bool,
-    build_menu: bool,
+    build_plan: Option<TileRole>,
     selecting: Option<(Point2<f32>, Point2<f32>)>,
     pointing_at_tile: (usize, usize),
     pointing_at_unit: Option<UnitId>,
@@ -20,7 +20,8 @@ struct MyGame {
     worker_turret_image: graphics::Image,
     sand_image: graphics::Image,
     rock_images: Vec<graphics::Image>,
-    conveyor_images: Vec<graphics::Image>,
+    conveyor_straight_images: Vec<graphics::Image>,
+    conveyor_curved_images: Vec<graphics::Image>,
     conveyor_ghost_image: graphics::Image,
     mine_image: graphics::Image,
     link_image: graphics::Image,
@@ -156,22 +157,41 @@ impl GameMap {
         true
     }
 
-    fn to_tile(&self, point: Point2<f32>) -> (usize, usize) {
-        let (x, y) = ((point.x / 32.0).floor(), (point.y / 32.0).floor());
-
+    fn confine_to_map_limits(&self, x: i32, y: i32) -> (usize, usize) {
         let x = match x {
-            i if i < 0.0 => 0,
-            i if i >= self.width as f32 => self.width - 1,
+            i if i < 0 => 0,
+            i if i >= self.width as i32 => self.width - 1,
             i => i as usize,
         };
 
         let y = match y {
-            i if i < 0.0 => 0,
-            i if i >= self.height as f32 => self.height - 1,
+            i if i < 0 => 0,
+            i if i >= self.height as i32 => self.height - 1,
             i => i as usize,
         };
 
         (x, y)
+    }
+
+    fn tile_in_direction(&self, (x, y): (usize, usize), direction: Direction) -> (usize, usize) {
+        let (x, y) = (x as i32, y as i32);
+        let (x, y) = match direction {
+            Direction::Up => (x, y - 1),
+            Direction::Right => (x + 1, y),
+            Direction::Down => (x, y + 1),
+            Direction::Left => (x - 1, y),
+        };
+
+        self.confine_to_map_limits(x, y)
+    }
+
+    fn to_tile(&self, point: Point2<f32>) -> (usize, usize) {
+        let (x, y) = (
+            (point.x / 32.0).floor() as i32,
+            (point.y / 32.0).floor() as i32,
+        );
+
+        self.confine_to_map_limits(x, y)
     }
 }
 
@@ -188,7 +208,11 @@ struct GroundTile {
 
 impl GroundTile {
     fn passable(&self) -> bool {
-        self.role == TileRole::Ground || self.role == TileRole::Conveyor
+        match self.role {
+            TileRole::Ground => true,
+            TileRole::Conveyor { .. } => true,
+            TileRole::Rock => false,
+        }
     }
 }
 
@@ -204,11 +228,16 @@ impl MyGame {
                 format!("/rock_sprite_{}.png", frame),
             )?);
         }
-        let mut conveyor_images = vec![];
+        let mut conveyor_straight_images = vec![];
+        let mut conveyor_curved_images = vec![];
         for frame in 0..=13 {
-            conveyor_images.push(graphics::Image::new(
+            conveyor_straight_images.push(graphics::Image::new(
                 ctx,
                 format!("/conveyor_straight_{:02}.png", frame),
+            )?);
+            conveyor_curved_images.push(graphics::Image::new(
+                ctx,
+                format!("/conveyor_curved_{:02}.png", frame),
             )?);
         }
         let conveyor_ghost_image = graphics::Image::new(ctx, "/conveyor_straight_ghost.png")?;
@@ -236,7 +265,7 @@ impl MyGame {
         Ok(Self {
             focus_color: 0.2,
             focused: true,
-            build_menu: false,
+            build_plan: None,
             selecting: None,
             units: Vec::default(),
             window_size: Vector2::new(0.0, 0.0),
@@ -246,7 +275,8 @@ impl MyGame {
             worker_turret_image,
             sand_image,
             rock_images,
-            conveyor_images,
+            conveyor_straight_images,
+            conveyor_curved_images,
             conveyor_ghost_image,
             mine_image,
             link_image,
@@ -379,7 +409,35 @@ enum UnitAction {
 enum TileRole {
     Ground,
     Rock,
-    Conveyor,
+    Conveyor { direction: Direction },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+
+impl Direction {
+    fn to_vector(&self) -> Vector2<f32> {
+        match self {
+            Direction::Up => Vector2::new(0.0, -1.0),
+            Direction::Right => Vector2::new(1.0, 0.0),
+            Direction::Down => Vector2::new(0.0, 1.0),
+            Direction::Left => Vector2::new(-1.0, 0.0),
+        }
+    }
+
+    fn next(&self) -> Direction {
+        match self {
+            Direction::Up => Direction::Right,
+            Direction::Right => Direction::Down,
+            Direction::Down => Direction::Left,
+            Direction::Left => Direction::Up,
+        }
+    }
 }
 
 impl Default for TileRole {
@@ -459,7 +517,8 @@ impl EventHandler for MyGame {
             self.focus_color -= 0.01;
         }
 
-        self.conveyor_animation = (self.conveyor_animation + 1) % (self.conveyor_images.len() * 3);
+        self.conveyor_animation =
+            (self.conveyor_animation + 1) % (self.conveyor_straight_images.len() * 3);
 
         let mut create_units = vec![];
 
@@ -489,8 +548,8 @@ impl EventHandler for MyGame {
 
             // Move on conveyors.
             let tile = self.game_map.to_tile(self.units[u].position);
-            if self.game_map.tile(tile.0, tile.1).role == TileRole::Conveyor {
-                self.units[u].position += Vector2::new(0.0, -0.7);
+            if let TileRole::Conveyor { direction } = self.game_map.tile(tile.0, tile.1).role {
+                self.units[u].position += direction.to_vector() * 0.7;
             }
 
             let (direction, target) = {
@@ -732,22 +791,38 @@ impl EventHandler for MyGame {
                 match tile.role {
                     TileRole::Ground => (),
                     TileRole::Rock => (),
-                    TileRole::Conveyor => {
+                    TileRole::Conveyor { direction } => {
+                        let connected_tile =
+                            self.game_map.tile_in_direction((x, y), direction.next());
+                        let draw_curved =
+                            self.game_map.tile(connected_tile.0, connected_tile.1).role
+                                == TileRole::Conveyor {
+                                    direction: direction.next().next().next(),
+                                };
+                        let direction = if draw_curved {
+                            direction.next().next()
+                        } else {
+                            direction
+                        };
+
                         let draw_param = graphics::DrawParam::new()
                             .offset(Point2::new(0.5, 0.5))
+                            .rotation(to_angle(direction.to_vector()))
                             .dest(tile_center((x, y)));
-                        graphics::draw(
-                            ctx,
-                            &self.conveyor_images[self.conveyor_animation / 3],
-                            draw_param,
-                        )?;
+                        let image = if draw_curved {
+                            &self.conveyor_curved_images[self.conveyor_animation / 3]
+                        } else {
+                            &self.conveyor_straight_images[self.conveyor_animation / 3]
+                        };
+                        graphics::draw(ctx, image, draw_param)?;
                     }
                 }
 
                 match tile.build_plan {
-                    Some(TileRole::Conveyor) => {
+                    Some(TileRole::Conveyor { direction }) => {
                         let draw_param = graphics::DrawParam::new()
                             .offset(Point2::new(0.5, 0.5))
+                            .rotation(to_angle(direction.to_vector()))
                             .dest(tile_center((x, y)))
                             .color((1.0, 1.0, 1.0, 0.3).into());
                         graphics::draw(ctx, &self.conveyor_ghost_image, draw_param)?;
@@ -836,12 +911,15 @@ impl EventHandler for MyGame {
         }
 
         // Draw build ghosts
-        if self.build_menu && self.pointing_at(TileRole::Ground) {
-            let draw_param = graphics::DrawParam::new()
-                .offset(Point2::new(0.5, 0.5))
-                .dest(tile_center(self.pointing_at_tile))
-                .color((1.0, 1.0, 1.0, 0.5).into());
-            graphics::draw(ctx, &self.conveyor_ghost_image, draw_param)?;
+        if let Some(TileRole::Conveyor { direction }) = self.build_plan {
+            if self.pointing_at(TileRole::Ground) {
+                let draw_param = graphics::DrawParam::new()
+                    .offset(Point2::new(0.5, 0.5))
+                    .rotation(to_angle(direction.to_vector()))
+                    .dest(tile_center(self.pointing_at_tile))
+                    .color((1.0, 1.0, 1.0, 0.5).into());
+                graphics::draw(ctx, &self.conveyor_ghost_image, draw_param)?;
+            }
         }
 
         // Draw mining effects
@@ -899,8 +977,8 @@ impl EventHandler for MyGame {
 
     fn mouse_button_down_event(&mut self, _ctx: &mut Context, button: MouseButton, x: f32, y: f32) {
         if button == MouseButton::Left && x > 0.0 && y > 0.0 {
-            if self.build_menu && self.pointing_at(TileRole::Ground) {
-                self.game_map.tile_mut(self.pointing_at_tile).build_plan = Some(TileRole::Conveyor);
+            if self.build_plan.is_some() && self.pointing_at(TileRole::Ground) {
+                self.game_map.tile_mut(self.pointing_at_tile).build_plan = self.build_plan;
             } else {
                 self.selecting = Some((Point2::new(x, y), Point2::new(x, y)));
             }
@@ -995,6 +1073,14 @@ impl EventHandler for MyGame {
         }
     }
 
+    fn mouse_wheel_event(&mut self, _ctx: &mut Context, _x: f32, _y: f32) {
+        if let Some(TileRole::Conveyor { direction }) = self.build_plan {
+            self.build_plan = Some(TileRole::Conveyor {
+                direction: direction.next(),
+            });
+        }
+    }
+
     fn key_down_event(
         &mut self,
         ctx: &mut Context,
@@ -1005,7 +1091,12 @@ impl EventHandler for MyGame {
         if keycode == ggez::input::keyboard::KeyCode::Escape {
             ggez::quit(ctx);
         } else if keycode == ggez::input::keyboard::KeyCode::B {
-            self.build_menu = !self.build_menu;
+            self.build_plan = match self.build_plan {
+                None => Some(TileRole::Conveyor {
+                    direction: Direction::Up,
+                }),
+                Some(_) => None,
+            };
         }
     }
 
