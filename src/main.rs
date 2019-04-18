@@ -1,6 +1,6 @@
 use ggez::event::{self, EventHandler, MouseButton};
 use ggez::graphics;
-use ggez::nalgebra::{Point2, Vector2};
+use ggez::nalgebra::{Point2, Rotation2, Vector2};
 use ggez::{Context, ContextBuilder, GameResult};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -23,6 +23,7 @@ struct MyGame {
     conveyor_straight_images: Vec<graphics::Image>,
     conveyor_curved_images: Vec<graphics::Image>,
     conveyor_ghost_image: graphics::Image,
+    building_images: Vec<graphics::Image>,
     mine_image: graphics::Image,
     link_image: graphics::Image,
 }
@@ -204,6 +205,7 @@ struct GroundTile {
     role: TileRole,
     build_plan: Option<TileRole>,
     mining_progress: u8,
+    building_progress: u8,
 }
 
 impl GroundTile {
@@ -241,6 +243,13 @@ impl MyGame {
             )?);
         }
         let conveyor_ghost_image = graphics::Image::new(ctx, "/conveyor_straight_ghost.png")?;
+        let mut building_images = vec![];
+        for frame in 0..=7 {
+            building_images.push(graphics::Image::new(
+                ctx,
+                format!("/building_{}.png", frame),
+            )?);
+        }
         let mine_image = graphics::Image::new(ctx, "/mine.png")?;
         let link_image = graphics::Image::new(ctx, "/link.png")?;
 
@@ -278,6 +287,7 @@ impl MyGame {
             conveyor_straight_images,
             conveyor_curved_images,
             conveyor_ghost_image,
+            building_images,
             mine_image,
             link_image,
             pointing_at_tile: (0, 0),
@@ -398,6 +408,7 @@ enum UnitAction {
     },
     Building {
         tile: (usize, usize),
+        active: bool,
     },
     StartHooking {
         hook_unit: UnitId,
@@ -549,7 +560,21 @@ impl EventHandler for MyGame {
             // Move on conveyors.
             let tile = self.game_map.to_tile(self.units[u].position);
             if let TileRole::Conveyor { direction } = self.game_map.tile(tile.0, tile.1).role {
-                self.units[u].position += direction.to_vector() * 0.7;
+                let connected_tile = self.game_map.tile_in_direction(tile, direction.next());
+                let curved_conveyor = self.game_map.tile(connected_tile.0, connected_tile.1).role
+                    == TileRole::Conveyor {
+                        direction: direction.next().next().next(),
+                    };
+
+                let direction = if curved_conveyor {
+                    // Rotate 45 degrees
+                    let rotation = Rotation2::new(-std::f32::consts::PI / 4.0);
+                    rotation * direction.to_vector()
+                } else {
+                    direction.to_vector()
+                };
+
+                self.units[u].position += direction * 0.7;
             }
 
             let (direction, target) = {
@@ -639,16 +664,26 @@ impl EventHandler for MyGame {
                 }
 
                 // Build.
-                UnitAction::Building { tile } => {
+                UnitAction::Building { tile, active: _ } => {
                     let unit = &mut self.units[u];
 
                     let distance = (unit.position - tile_center(tile)).norm();
 
                     if distance < 64.0 {
+                        unit.action = UnitAction::Building { tile, active: true };
+
                         let tile = self.game_map.tile_mut(tile);
                         if let Some(build_plan) = tile.build_plan {
-                            tile.role = build_plan;
-                            tile.build_plan = None;
+                            tile.building_progress += 3;
+
+                            if tile.building_progress > 100 {
+                                tile.role = build_plan;
+                                tile.build_plan = None;
+                                tile.building_progress = 0;
+                            } else {
+                                unit.intended_direction = None;
+                                continue;
+                            }
                         }
 
                         unit.action = UnitAction::Normal;
@@ -657,6 +692,11 @@ impl EventHandler for MyGame {
                         unit.intended_direction = None;
 
                         continue;
+                    } else {
+                        unit.action = UnitAction::Building {
+                            tile,
+                            active: false,
+                        };
                     }
                 }
 
@@ -829,6 +869,15 @@ impl EventHandler for MyGame {
                     }
                     _ => (),
                 }
+
+                if tile.building_progress > 0 {
+                    let draw_param = graphics::DrawParam::new()
+                        .offset(Point2::new(0.5, 0.5))
+                        .dest(tile_center((x, y)))
+                        .color((0.0, 0.0, 0.0, 1.0).into());
+                    let frame = (tile.building_progress as usize / 2) % self.building_images.len();
+                    graphics::draw(ctx, &self.building_images[frame], draw_param)?;
+                }
             }
         }
 
@@ -956,6 +1005,32 @@ impl EventHandler for MyGame {
             }
         }
 
+        // Draw building effects
+        for unit in self.units.iter() {
+            if let UnitAction::Building { tile, active: true } = unit.action {
+                let center = tile_center(tile);
+                let tile = self.game_map.tile(tile.0, tile.1);
+
+                let height = -16.0 + 32.0 * (tile.building_progress as f32 / 100.0);
+
+                if (height + center.y).round() != unit.position.y.round() {
+                    let mesh = graphics::Mesh::new_polyline(
+                        ctx,
+                        graphics::DrawMode::fill(),
+                        &[
+                            unit.position,
+                            center + Vector2::new(16.0, height),
+                            center + Vector2::new(-16.0, height),
+                            unit.position,
+                        ],
+                        (0.7, 0.7, 1.0, 0.2).into(),
+                    )?;
+
+                    graphics::draw(ctx, &mesh, graphics::DrawParam::default())?;
+                }
+            }
+        }
+
         // Draw hooking/towing effects
         for u in 0..self.units.len() {
             if let Some(ref hooking_unit) = self.units[u].hooking_unit {
@@ -1020,7 +1095,10 @@ impl EventHandler for MyGame {
                             }
                         }
                     } else if pointing_at_build_plan.is_some() {
-                        selected_unit.action = UnitAction::Building { tile };
+                        selected_unit.action = UnitAction::Building {
+                            tile,
+                            active: false,
+                        };
                     } else {
                         selected_unit.action = UnitAction::Normal;
                     }
@@ -1097,6 +1175,20 @@ impl EventHandler for MyGame {
                 }),
                 Some(_) => None,
             };
+        };
+
+        if let Some(TileRole::Conveyor { direction: _ }) = self.build_plan {
+            let direction = match keycode {
+                ggez::input::keyboard::KeyCode::Up => Some(Direction::Up),
+                ggez::input::keyboard::KeyCode::Right => Some(Direction::Right),
+                ggez::input::keyboard::KeyCode::Down => Some(Direction::Down),
+                ggez::input::keyboard::KeyCode::Left => Some(Direction::Left),
+                _ => None,
+            };
+
+            if let Some(direction) = direction {
+                self.build_plan = Some(TileRole::Conveyor { direction });
+            }
         }
     }
 
