@@ -4,7 +4,7 @@ It's supposed to be an RTS written in Rust, but I still don't know what I'm doin
 
 Right now it looks like this:
 
-![Mining](/screenshots/1-mining.png?raw=true)
+![Conveyors](/screenshots/2-conveyors.png?raw=true)
 
 Current features:
 * Made easily with [ggez](https://docs.rs/crate/ggez)!
